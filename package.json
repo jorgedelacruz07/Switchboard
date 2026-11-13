@@ -1,0 +1,28 @@
+{
+  "name": "switchboard",
+  "version": "0.2.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Native macOS project controls, AI usage and provider availability.",
+  "engines": {
+    "node": ">=26 <27"
+  },
+  "scripts": {
+    "status": "node Features/ProviderStatus/src/cli.js status",
+    "status:json": "node Features/ProviderStatus/src/cli.js status --json",
+    "status:once": "node Features/ProviderStatus/src/cli.js once",
+    "test": "node --test Features/ProviderStatus/test/",
+    "format": "prettier --write Features/ProviderStatus/src Features/ProviderStatus/test Features/ProviderStatus/integrations Features/ProviderStatus/README.md README.md AGENTS.md package.json",
+    "format:check": "prettier --check Features/ProviderStatus/src Features/ProviderStatus/test Features/ProviderStatus/integrations Features/ProviderStatus/README.md README.md AGENTS.md package.json",
+    "lint": "node --check Features/ProviderStatus/src/cli.js && node --check Features/ProviderStatus/src/monitor.js && node --check Features/ProviderStatus/src/notify.js && node --check Features/ProviderStatus/src/sources.js && node --check Features/ProviderStatus/test/monitor.test.js && npm run format:check",
+    "quick": "npm run lint && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jorgedelacruz07/Switchboard.git"
+  },
+  "devDependencies": {
+    "prettier": "3.9.10"
+  }
+}

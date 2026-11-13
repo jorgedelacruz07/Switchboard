@@ -1,0 +1,64 @@
+# Paquete de Home Assistant: convierte el webhook del monitor en un pulso de 10 s sobre un
+# interruptor interno por herramienta. Solo su sensor de contacto se expone a Alexa por
+# Matter y una rutina lo usa como disparador para decir la frase en voz alta.
+#
+# Requiere en configuration.yaml:
+#   homeassistant:
+#     packages: !include_dir_named packages
+# y en secrets.yaml (solo en el NAS, nunca en git):
+#   ai_status_webhook_id: <cadena aleatoria larga>
+
+input_boolean:
+  ai_claude_ready:
+    name: "IA Claude disponible"
+  ai_openai_ready:
+    name: "IA GPT disponible"
+  ai_antigravity_ready:
+    name: "IA Antigravity disponible"
+  ai_opencode_ready:
+    name: "IA OpenCode disponible"
+
+# Alexa no recibe bien los cambios de estado de un enchufe Matter (el input_boolean), así
+# que cada interruptor se refleja en un sensor de contacto virtual: el puente Matter lo
+# expone como ContactSensor y Alexa sí lo ofrece como disparador de rutinas.
+template:
+  - binary_sensor:
+      - name: "AI Claude aviso"
+        unique_id: ai_claude_aviso
+        device_class: door
+        state: "{{ is_state('input_boolean.ai_claude_ready', 'on') }}"
+      - name: "AI GPT aviso"
+        unique_id: ai_openai_aviso
+        device_class: door
+        state: "{{ is_state('input_boolean.ai_openai_ready', 'on') }}"
+      - name: "AI Antigravity aviso"
+        unique_id: ai_antigravity_aviso
+        device_class: door
+        state: "{{ is_state('input_boolean.ai_antigravity_ready', 'on') }}"
+      - name: "AI OpenCode aviso"
+        unique_id: ai_opencode_aviso
+        device_class: door
+        state: "{{ is_state('input_boolean.ai_opencode_ready', 'on') }}"
+
+automation:
+  - id: ai_status_recovered_pulse
+    alias: "AI status: pulso al recuperarse una herramienta"
+    mode: queued
+    triggers:
+      - trigger: webhook
+        webhook_id: !secret ai_status_webhook_id
+        allowed_methods: [POST]
+        local_only: true
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.json.event == 'recovered'
+             and trigger.json.tool in ['claude', 'openai', 'antigravity', 'opencode'] }}
+    actions:
+      - action: input_boolean.turn_on
+        target:
+          entity_id: "input_boolean.ai_{{ trigger.json.tool }}_ready"
+      - delay: "00:00:10"
+      - action: input_boolean.turn_off
+        target:
+          entity_id: "input_boolean.ai_{{ trigger.json.tool }}_ready"

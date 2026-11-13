@@ -1,0 +1,39 @@
+# Home Assistant + puente Matter para anuncios de voz en el Echo.
+# Destino: NAS (ugreen-nas). Se lanza desde la Mini con DOCKER_HOST=ssh://nas; por eso las
+# rutas de volúmenes son absolutas y del NAS. Ver README.md (en esta carpeta).
+#
+# Fase 1: solo Home Assistant      -> HAMH_HA_TOKEN=pendiente docker compose up -d homeassistant
+#   (Compose interpola todas las variables aunque el servicio no esté activo; el valor de
+#    relleno solo evita ese error y no se usa porque matter-hub requiere el perfil `bridge`.)
+# Fase 2: con el token ya creado   -> doppler run ... -- docker compose --profile bridge up -d
+#
+# network_mode: host es obligatorio: Matter usa mDNS/UDP y no atraviesa la red bridge de Docker.
+# Los límites de memoria protegen a Immich y al resto de servicios del NAS (7.7 GB en total).
+
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: homeassistant
+    network_mode: host
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      - TZ=America/Lima
+    volumes:
+      - /volume1/docker/homeassistant/config:/config
+      - /etc/localtime:/etc/localtime:ro
+
+  matter-hub:
+    image: ghcr.io/t0bst4r/home-assistant-matter-hub:latest
+    container_name: matter-hub
+    profiles: ["bridge"]
+    network_mode: host
+    restart: unless-stopped
+    mem_limit: 384m
+    environment:
+      - HAMH_HOME_ASSISTANT_URL=http://127.0.0.1:8123/
+      - HAMH_HOME_ASSISTANT_ACCESS_TOKEN=${HAMH_HA_TOKEN:?define HAMH_HA_TOKEN (Doppler)}
+      - HAMH_LOG_LEVEL=info
+      - HAMH_HTTP_PORT=8482
+    volumes:
+      - /volume1/docker/homeassistant/matter-hub:/data

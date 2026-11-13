@@ -1,0 +1,14 @@
+.DS_Store
+.local/
+build/
+node_modules/
+*.log
+*.xcuserstate
+__pycache__/
+Features/ProviderStatus/.data/
+Features/ProviderStatus/.env
+Features/ProviderStatus/.env.*
+Features/ProviderStatus/secrets.yaml
+Features/ProviderStatus/secrets.yml
+Features/ProviderStatus/*.pem
+Features/ProviderStatus/*.key
