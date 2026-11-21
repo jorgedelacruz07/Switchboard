@@ -104,7 +104,13 @@ func selfTest() throws {
 }
 
 do {
-    if CommandLine.arguments.contains("--self-test") { try selfTest(); try usageSelfTest(); try menuSelfTest(); try loginSelfTest(); exit(0) }
+    if CommandLine.arguments.contains("--self-test") {
+        try selfTest(); try usageSelfTest(); try menuSelfTest(); try loginSelfTest(); try refreshSelfTest()
+        // The test binary lives in <app root>/build; the fixture is shared with the Node tests.
+        let testRoot = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().deletingLastPathComponent().deletingLastPathComponent()
+        try providerStatusSelfTest(fixture: testRoot.appendingPathComponent("Features/ProviderStatus/test/fixtures/parity.json"))
+        exit(0)
+    }
     if let index = CommandLine.arguments.firstIndex(of: "--capture-claude-usage"), CommandLine.arguments.count == index + 2 {
         var data = Data()
         while let chunk = try FileHandle.standardInput.read(upToCount: 16384), !chunk.isEmpty {
@@ -145,7 +151,9 @@ do {
         if CommandLine.arguments.contains("--client") { role = .client }
         else if CommandLine.arguments.contains("--host") { role = .host }
         else { role = Controller.detectRole(root: root, appRoot: appRootURL) }
-        let (values, _) = try Controller.snapshot(root: root, role: role)
+        // --no-git mirrors the app's one-minute tick, which reuses its cached Git map.
+        let gitMap: [String: ProjectGitStatus]? = CommandLine.arguments.contains("--no-git") ? [:] : nil
+        let (values, _) = try Controller.snapshot(root: root, appRoot: appRootURL, role: role, gitMap: gitMap)
         let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         print(String(decoding: try encoder.encode(values), as: UTF8.self)); exit(0)
     }

@@ -54,6 +54,24 @@ struct MenuPreferences: Equatable {
     }
 }
 
+enum RefreshPolicy {
+    static let gitRefreshInterval: TimeInterval = 300
+    static let menuOpenSnapshotCooldown: TimeInterval = 15
+    static let menuOpenGitCooldown: TimeInterval = 60
+
+    static func shouldRunMenuOpenRefresh(lastSnapshot: Date?, now: Date = Date()) -> Bool {
+        guard let lastSnapshot else { return true }
+        return now.timeIntervalSince(lastSnapshot) >= menuOpenSnapshotCooldown
+    }
+
+    static func shouldRefreshGit(lastGitRefresh: Date?, force: Bool, fromMenuOpen: Bool, now: Date = Date()) -> Bool {
+        if force { return true }
+        guard let lastGitRefresh else { return true }
+        let interval = fromMenuOpen ? menuOpenGitCooldown : gitRefreshInterval
+        return now.timeIntervalSince(lastGitRefresh) >= interval
+    }
+}
+
 enum MenuModel {
     static func group(of project: Project) -> MenuGroup {
         if project.archived { return .archived }

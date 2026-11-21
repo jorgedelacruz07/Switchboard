@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { step, DEFAULTS } from "../src/monitor.js";
 import { fromStatuspage, fromGoogleIncidents, fromOpenCodeStatus } from "../src/sources.js";
 import { makeNotifier } from "../src/notify.js";
+import { readFileSync } from "node:fs";
 
 const MIN = 60_000;
 const ok = { status: "ok" };
@@ -206,3 +207,23 @@ test("DRY_RUN no dispara el webhook aunque esté configurado", async (t) => {
   await notify({ id: "claude", label: "Claude", event: "recovered" });
   assert.equal(fetchMock.mock.callCount(), 0);
 });
+
+// Shared with the native Swift parsers (AIProviderStatus.swift); both must agree.
+const parity = JSON.parse(readFileSync(new URL("./fixtures/parity.json", import.meta.url), "utf8"));
+const parsers = {
+  statuspage: (item) => fromStatuspage(item.input, item.relevant),
+  google: (item) => fromGoogleIncidents(item.input),
+  opencode: (item) => fromOpenCodeStatus(item.input),
+};
+
+for (const item of parity.cases) {
+  test(`provider parity: ${item.name}`, () => {
+    let observed;
+    try {
+      observed = parsers[item.parser](item).status;
+    } catch {
+      observed = "error";
+    }
+    assert.equal(observed, item.expect);
+  });
+}

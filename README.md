@@ -20,6 +20,8 @@ telemetry, or additional API keys.
   tunnel or Live Sync; generic sync, stop and restart controls are excluded to
   protect host-owned data and active planning jobs.
 - See running, partially running, and stopped projects, refreshed every minute.
+  Git status refreshes every five minutes, when the menu opens (one-minute
+  cooldown) and after an action; the per-minute tick never spawns Git.
 - See every project in the menu on one line (for example `AcademyDB · Running · :5173`), open it at `http://localhost:<port>`, and view its logs.
 - Open each project's production site, production API, repository and ProjectsDocs page from its submenu, when those links are configured.
 - Hide projects and reorder them per Mac, and edit production links, from **Configure Projects…**.
@@ -325,9 +327,11 @@ quota, and no browser, IDE, or agent is launched for monitoring.
 | Gemini / Antigravity | Model quota from an already-running Antigravity IDE's loopback service.                         | IDE account/model quota, not Gemini web or weekly quota. Reset-only responses show the reset time with percentage unavailable. |
 
 Provider availability is read from the `Features/ProviderStatus/` feature module.
-The app runs its read-only JSON command as a short Node child process, so no
-additional resident service is required. Checks use public endpoints, need no
-provider credentials and can be paused independently from usage reads.
+The app reads the same public endpoints natively with an ephemeral `URLSession`
+(no Node child process, cookies or cache); the Node `status --json` command stays
+available for the terminal and notifications. Both parsers are checked against
+`Features/ProviderStatus/test/fixtures/parity.json`. Checks need no provider
+credentials and can be paused independently from usage reads.
 
 | Provider    | Public status source                   | Boundary                                             |
 | ----------- | -------------------------------------- | ---------------------------------------------------- |

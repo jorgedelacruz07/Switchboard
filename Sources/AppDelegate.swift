@@ -6,6 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // Provider and quota probes can each create short-lived helpers. Keep them
     // sequential so startup and manual refreshes do not stack their peak memory.
     private static let aiRefreshQueue = DispatchQueue(label: "projects.menu.ai-refresh", qos: .utility)
+    // One Git helper at a time; the helper bounds its own per-repo concurrency.
+    private static let gitRefreshQueue = DispatchQueue(label: "projects.menu.git-refresh", qos: .utility)
 
     let root: URL
     let appRoot: URL
@@ -22,6 +24,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var refreshing = false
     var tracking = false
     var timer: Timer?
+    var gitTimer: Timer?
+    var lastSnapshot: Date?
+    var gitMap: [String: ProjectGitStatus] = [:]
+    var gitRefreshing = false
+    var lastGitRefresh: Date?
     var usageTimer: Timer?
     var providerStatusTimer: Timer?
     var usage: [AIUsage] = []
@@ -70,7 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         updateStatusItemAppearance()
         rebuildMenu()
-        refresh()
+        refresh(forceGit: true)
         refreshUsage()
         refreshProviderStatus()
         usageTimer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in self?.refreshUsage() }
@@ -79,9 +86,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         providerStatusTimer?.tolerance = 30
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refresh() }
         timer?.tolerance = 10
+        gitTimer = Timer.scheduledTimer(withTimeInterval: RefreshPolicy.gitRefreshInterval, repeats: true) { [weak self] _ in self?.refreshGit() }
+        gitTimer?.tolerance = 30
     }
 
-    func menuWillOpen(_ menu: NSMenu) { tracking = true; refresh() }
+    func menuWillOpen(_ menu: NSMenu) {
+        tracking = true
+        if RefreshPolicy.shouldRunMenuOpenRefresh(lastSnapshot: lastSnapshot) { refresh() }
+        refreshGit(fromMenuOpen: true)
+    }
     func menuDidClose(_ menu: NSMenu) {
         tracking = false
         DispatchQueue.main.async { if !self.tracking { self.rebuildMenu() } }
@@ -153,27 +166,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func refresh() {
+    func refresh(forceGit: Bool = false) {
+        if forceGit { refreshGit(force: true) }
         guard !refreshing else { return }
         refreshing = true
+        lastSnapshot = Date()
         let root = self.root
         let currentAppRoot = self.appRoot
         let currentRole = self.role
+        let cachedGit = self.gitMap
+        let readClaude = self.usageEnabled
         DispatchQueue.global(qos: .utility).async {
-            let result = Result { try Controller.snapshot(root: root, appRoot: currentAppRoot, role: currentRole) }
+            // The cached Git map keeps this per-minute tick free of Git subprocesses.
+            let result = Result { try Controller.snapshot(root: root, appRoot: currentAppRoot, role: currentRole, gitMap: cachedGit) }
             // A missing or malformed registry yields no entries: the menu renders without links.
             let entries = Registry.entries(root: root)
             let portal = Controller.portalURL(root: root)
             let loginReport = self.loginService.diagnostic()
+            // File read + account hash stay off the main thread.
+            let claudeUsage = readClaude ? UsageReader.claude(appRoot: currentAppRoot) : nil
             DispatchQueue.main.async {
                 self.loginReport = loginReport
                 self.refreshing = false
-                if self.usageEnabled, let index = self.usage.firstIndex(where: { $0.id == "claude" }) {
-                    self.usage[index] = UsageReader.claude(appRoot: self.appRoot)
+                if self.usageEnabled, let claudeUsage, let index = self.usage.firstIndex(where: { $0.id == "claude" }) {
+                    self.usage[index] = claudeUsage
                 }
                 switch result {
                 case .success(let (values, remote)):
-                    self.statuses = values
+                    // A Git refresh may have landed while this snapshot ran; keep the newest map.
+                    self.statuses = Controller.applying(self.gitMap, to: values)
                     self.remoteStatus = remote
                     self.refreshError = nil
                 case .failure(let error):
@@ -181,6 +202,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 self.registryEntries = entries
                 self.portalBase = portal
+                self.updateStatusTitle()
+                if !self.tracking { self.rebuildMenu() }
+            }
+        }
+    }
+
+    func refreshGit(force: Bool = false, fromMenuOpen: Bool = false) {
+        guard !gitRefreshing,
+              RefreshPolicy.shouldRefreshGit(lastGitRefresh: lastGitRefresh, force: force, fromMenuOpen: fromMenuOpen) else { return }
+        gitRefreshing = true
+        lastGitRefresh = Date()
+        let root = self.root
+        let currentAppRoot = self.appRoot
+        Self.gitRefreshQueue.async {
+            let map = Controller.workspaceGitStatuses(root: root, appRoot: currentAppRoot)
+            DispatchQueue.main.async {
+                self.gitRefreshing = false
+                self.gitMap = map
+                self.statuses = Controller.applying(map, to: self.statuses)
                 self.updateStatusTitle()
                 if !self.tracking { self.rebuildMenu() }
             }
@@ -799,7 +839,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(url)
     }
 
-    @objc func refreshNow() { refresh() }
+    @objc func refreshNow() { refresh(forceGit: true) }
     @objc func openWeb(_ sender: NSMenuItem) {
         guard let port = sender.representedObject as? Int, let url = Project(key: "", directory: "", ports: [], webPort: port).webURL else { return }
         NSWorkspace.shared.open(url)
@@ -960,7 +1000,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     failureDetail = error.localizedDescription
                     failure = true
                 }
-                self.refresh()
+                self.refresh(forceGit: true)
                 self.rebuildMenu()
                 if let detail = failureDetail { self.showText("Action failed", detail) }
                 else if failure { self.showLastResult() }
@@ -998,7 +1038,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func showLastResult() {
-        let text = refreshError ?? ((try? String(contentsOf: actionLog, encoding: .utf8)).map { String($0.suffix(50000)) } ?? (role == .client ? "Switchboard (Client Mode) controls remote development on Mac Mini.\n\n• Use 'Dev Tunnel' to forward all project ports.\n• Use 'Start Remote Work' to reuse Mini files, dev servers and tunnels.\n• Use 'Stop Remote Dev Server' to stop the selected Mini server." : "Choose a project to start or stop. Project status refreshes every minute. AI usage and provider status refresh every five minutes.\n\nStart All respects the launcher’s memory guard and may stop before every project starts.\n\nStop All stops development servers. Databases and other services keep running."))
+        let text = refreshError ?? ((try? String(contentsOf: actionLog, encoding: .utf8)).map { String($0.suffix(50000)) } ?? (role == .client ? "Switchboard (Client Mode) controls remote development on Mac Mini.\n\n• Use 'Dev Tunnel' to forward all project ports.\n• Use 'Start Remote Work' to reuse Mini files, dev servers and tunnels.\n• Use 'Stop Remote Dev Server' to stop the selected Mini server." : "Choose a project to start or stop. Project status refreshes every minute; Git status every five minutes and when the menu opens. AI usage and provider status refresh every five minutes.\n\nStart All respects the launcher’s memory guard and may stop before every project starts.\n\nStop All stops development servers. Databases and other services keep running."))
         showText(role == .client ? "Switchboard (Client) · Result" : "Switchboard · Result", text)
     }
 

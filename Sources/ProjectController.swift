@@ -107,8 +107,25 @@ struct CommandResult {
     let output: String
 }
 
+enum ControllerError: Error, LocalizedError, Equatable {
+    case timedOut(executable: String, seconds: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case .timedOut(let executable, let seconds):
+            return "Command timed out after \(seconds)s: \((executable as NSString).lastPathComponent)"
+        }
+    }
+}
+
 enum Controller {
     static let logDirectory = URL(fileURLWithPath: "/tmp/project-dev-logs", isDirectory: true)
+    static let defaultCommandTimeout: TimeInterval = 15
+    // User-triggered actions (start all, quick check, deploy) can be slow; the cap only
+    // stops a hung child from pinning the action worker forever.
+    static let defaultExecuteTimeout: TimeInterval = 3600
+    static let gitStatusTimeout: TimeInterval = 60
+
     static func environment(root: URL) -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -120,7 +137,15 @@ enum Controller {
         return env
     }
 
-    static func command(_ executable: String, _ arguments: [String], root: URL) throws -> CommandResult {
+    private static func terminateSafely(_ process: Process, grace seconds: TimeInterval = 0.5) {
+        if process.isRunning { process.terminate() }
+        let grace = Date().addingTimeInterval(seconds)
+        while process.isRunning && Date() < grace { Thread.sleep(forTimeInterval: 0.02) }
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        process.waitUntilExit()
+    }
+
+    static func command(_ executable: String, _ arguments: [String], root: URL, timeout: TimeInterval = defaultCommandTimeout) throws -> CommandResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -129,9 +154,28 @@ enum Controller {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        let exitSem = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exitSem.signal() }
         try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+
+        let readSem = DispatchSemaphore(value: 0)
+        var data = Data()
+        DispatchQueue.global(qos: .utility).async {
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            readSem.signal()
+        }
+
+        if exitSem.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminationHandler = nil
+            terminateSafely(process)
+            try? pipe.fileHandleForReading.close()
+            _ = readSem.wait(timeout: .now() + 0.5)
+            throw ControllerError.timedOut(executable: executable, seconds: max(1, Int(timeout.rounded())))
+        }
+        if readSem.wait(timeout: .now() + 2) == .timedOut {
+            // A detached grandchild still holds the pipe; return what the command exited with.
+            try? pipe.fileHandleForReading.close()
+        }
         return CommandResult(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
     }
 
@@ -365,7 +409,7 @@ enum Controller {
         }
         let helper = appRoot.appendingPathComponent("scripts/project-git-status.py")
         guard FileManager.default.fileExists(atPath: helper.path) else { return [:] }
-        guard let result = try? command("/usr/bin/python3", [helper.path, "--root", root.path], root: root),
+        guard let result = try? command("/usr/bin/python3", [helper.path, "--root", root.path], root: root, timeout: gitStatusTimeout),
               result.status == 0,
               let data = result.output.data(using: .utf8),
               let map = try? JSONDecoder().decode([String: ProjectGitStatus].self, from: data) else {
@@ -374,7 +418,26 @@ enum Controller {
         return map
     }
 
-    static func snapshot(root: URL, appRoot: URL? = nil, role: MachineRole) throws -> ([ProjectStatus], RemoteStatus) {
+    static func gitStatus(for project: Project, in map: [String: ProjectGitStatus]) -> ProjectGitStatus? {
+        let cleanKey = project.key.hasPrefix("registry-") ? String(project.key.dropFirst("registry-".count)) : project.key
+        return map[project.key.lowercased()]
+            ?? map[cleanKey.lowercased()]
+            ?? map[project.name.lowercased()]
+            ?? map[project.directory.lowercased()]
+    }
+
+    // Re-applies a newer git map without re-reading ports, catalog or processes.
+    static func applying(_ map: [String: ProjectGitStatus], to statuses: [ProjectStatus]) -> [ProjectStatus] {
+        statuses.map { status in
+            var updated = status
+            updated.git = gitStatus(for: status.project, in: map)
+            return updated
+        }
+    }
+
+    // `gitMap: nil` runs the git helper inline (CLI snapshot). The app passes its cached
+    // map so the per-minute tick never spawns Git; Git refreshes on its own cadence.
+    static func snapshot(root: URL, appRoot: URL? = nil, role: MachineRole, gitMap cachedGitMap: [String: ProjectGitStatus]? = nil) throws -> ([ProjectStatus], RemoteStatus) {
         let projects = try catalog(root: root)
         let result = try command("/usr/sbin/lsof", ["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-Fpn"], root: root)
         guard result.status == 0 || (result.status == 1 && result.output.isEmpty) else {
@@ -387,14 +450,10 @@ enum Controller {
             remoteStatus.localMongoActive = ports.contains(27018)
             remoteStatus.localRedisActive = ports.contains(6380)
         }
-        let gitMap = workspaceGitStatuses(root: root, appRoot: appRoot)
+        let gitMap = cachedGitMap ?? workspaceGitStatuses(root: root, appRoot: appRoot)
 
         let statuses = allProjects.map { project -> ProjectStatus in
-            let cleanKey = project.key.hasPrefix("registry-") ? String(project.key.dropFirst("registry-".count)) : project.key
-            let git = gitMap[project.key.lowercased()]
-                ?? gitMap[cleanKey.lowercased()]
-                ?? gitMap[project.name.lowercased()]
-                ?? gitMap[project.directory.lowercased()]
+            let git = gitStatus(for: project, in: gitMap)
             if role == .client {
                 if project.isDocsPortal || project.isIdeaDesk {
                     let serviceURL = project.isIdeaDesk ? ideaDeskURL(root: root) : portalURL(root: root)
@@ -522,7 +581,7 @@ enum Controller {
         try executeCommand(root: root, executable: "/bin/bash", arguments: [root.appendingPathComponent(script).path] + arguments, log: log)
     }
 
-    static func executeCommand(root: URL, executable: String, arguments: [String], log: URL) throws -> Int32 {
+    static func executeCommand(root: URL, executable: String, arguments: [String], log: URL, timeout: TimeInterval = defaultExecuteTimeout) throws -> Int32 {
         if !FileManager.default.fileExists(atPath: log.path) {
             guard FileManager.default.createFile(atPath: log.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
                 throw CocoaError(.fileWriteUnknown)
@@ -539,8 +598,17 @@ enum Controller {
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = file
         process.standardError = file
+        let exitSem = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exitSem.signal() }
         try process.run()
-        process.waitUntilExit()
+        if exitSem.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminationHandler = nil
+            terminateSafely(process, grace: 5)
+            let seconds = max(1, Int(timeout.rounded()))
+            _ = try? file.seekToEnd()
+            try? file.write(contentsOf: Data("Switchboard stopped this action after \(seconds)s without completion.\n".utf8))
+            throw ControllerError.timedOut(executable: executable, seconds: seconds)
+        }
         return process.terminationStatus
     }
 
