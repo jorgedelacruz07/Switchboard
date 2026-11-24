@@ -1,8 +1,10 @@
 # Switchboard provider status engine
 
 This Node 26 feature module is part of the Switchboard repository. The Swift menu-bar
-app runs `status --json` every five minutes to show public provider availability.
-It uses native Node modules, makes no model requests and needs no provider keys.
+app shows public provider availability every five minutes through a native port of
+`src/sources.js` (`AIProviderStatus.swift`), so it starts no Node process. Both
+implementations must pass `test/fixtures/parity.json`; change them together. The
+module makes no model requests and needs no provider keys.
 
 ## Commands
 
@@ -47,5 +49,4 @@ transition command can be run manually when notifications are explicitly wanted.
 
 Node 26 is managed by mise. `npm ci` installs Prettier for development only.
 `npm run lint` checks syntax and formatting; `npm run quick` also runs the local
-test suite. The application calls only `status --json` and never invokes
-`once` automatically.
+test suite. The application never invokes `once` or the Node CLI automatically.

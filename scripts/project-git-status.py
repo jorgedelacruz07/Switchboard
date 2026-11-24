@@ -8,11 +8,58 @@ Never reaches out to the network: runs only local Git queries.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
-import sys
+
+MAX_WORKERS = 4
+# Background polling must never take index locks that contend with real Git work.
+GIT_ENV = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+
+
+def _v1_sample(line: str) -> str:
+    """Render a porcelain v2 entry like v1 (`XY path`) for the menu."""
+    kind = line[:1]
+    if kind == "?":
+        return "?? " + line[2:]
+    if kind == "!":
+        return "!! " + line[2:]
+    fields = {"1": 8, "2": 9, "u": 10}.get(kind)
+    if fields is None:
+        return line
+    parts = line.split(" ", fields)
+    if len(parts) <= fields:
+        return line
+    xy = parts[1].replace(".", " ")
+    path = parts[fields].split("\t", 1)[0]
+    return f"{xy} {path}"
+
+
+def _parse_porcelain_v2(output: str) -> tuple[str, int, int, list[str], bool]:
+    branch = "detached"
+    ahead = 0
+    behind = 0
+    saw_ab = False
+    dirty_samples: list[str] = []
+
+    for line in output.splitlines():
+        if not line:
+            continue
+        if line.startswith("# branch.head "):
+            head = line[len("# branch.head "):].strip()
+            branch = "detached" if head in ("", "(detached)") else head
+        elif line.startswith("# branch.ab "):
+            parts = line[len("# branch.ab "):].strip().split()
+            if len(parts) == 2 and parts[0].startswith("+") and parts[1].startswith("-"):
+                ahead = int(parts[0][1:])
+                behind = int(parts[1][1:])
+                saw_ab = True
+        elif not line.startswith("# "):
+            dirty_samples.append(_v1_sample(line))
+
+    return branch, ahead, behind, dirty_samples, saw_ab
 
 
 def check_single_repo(repo_path: Path, root: Path) -> dict | None:
@@ -21,44 +68,32 @@ def check_single_repo(repo_path: Path, root: Path) -> dict | None:
     if not (repo_path / ".git").exists():
         return None
     try:
-        # Branch
-        res_b = subprocess.run(
-            ["git", "-C", str(repo_path), "branch", "--show-current"],
+        res = subprocess.run(
+            ["git", "-C", str(repo_path), "status", "--porcelain=v2", "--branch"],
             capture_output=True,
             text=True,
             timeout=3,
+            env=GIT_ENV,
         )
-        branch = res_b.stdout.strip() or "detached"
+        if res.returncode != 0:
+            return None
 
-        # Dirty files (modified, staged, untracked)
-        res_s = subprocess.run(
-            ["git", "-C", str(repo_path), "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        dirty_lines = [l for l in res_s.stdout.strip().splitlines() if l]
+        branch, ahead, behind, dirty_lines, saw_ab = _parse_porcelain_v2(res.stdout)
 
-        # Ahead / behind against origin/<branch> (or @{u})
-        ahead, behind = 0, 0
-        res_ab = subprocess.run(
-            ["git", "-C", str(repo_path), "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        if res_ab.returncode != 0 and branch != "detached":
+        # Fallback only when branch has no configured upstream tracking ref.
+        if not saw_ab and branch != "detached":
             res_ab = subprocess.run(
-                ["git", "-C", str(repo_path), "rev-list", "--left-right", "--count", "@{u}...HEAD"],
+                ["git", "-C", str(repo_path), "rev-list", "--left-right", "--count", f"origin/{branch}...HEAD"],
                 capture_output=True,
                 text=True,
                 timeout=3,
+                env=GIT_ENV,
             )
-        if res_ab.returncode == 0:
-            parts = res_ab.stdout.strip().split()
-            if len(parts) == 2:
-                behind = int(parts[0])
-                ahead = int(parts[1])
+            if res_ab.returncode == 0:
+                parts = res_ab.stdout.strip().split()
+                if len(parts) == 2:
+                    behind = int(parts[0])
+                    ahead = int(parts[1])
 
         return {
             "name": repo_path.name,
@@ -69,11 +104,12 @@ def check_single_repo(repo_path: Path, root: Path) -> dict | None:
             "behind": behind,
             "samples": dirty_lines[:5],
         }
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, OSError, ValueError):
         return None
 
 
-def inspect_workspace(root: Path) -> dict:
+def inspect_workspace(root: Path, max_workers: int = MAX_WORKERS) -> dict:
+    root = root.resolve()
     registry_file = root / "workspace.registry.json"
     registry_data = {}
     if registry_file.is_file():
@@ -83,39 +119,62 @@ def inspect_workspace(root: Path) -> dict:
             pass
 
     projects = registry_data.get("projects", [])
-    results: dict[str, dict] = {}
+    project_repo_targets: list[tuple[dict, list[tuple[str, Path]]]] = []
+    unique_paths: dict[Path, Path] = {}
 
     for p in projects:
-        pid = str(p.get("id", ""))
         pname = str(p.get("name", ""))
         repos = p.get("repos", [])
+        targets: list[tuple[str, Path]] = []
 
-        repo_list = []
-        total_dirty = 0
-        total_ahead = 0
-        total_behind = 0
-        primary_branch = "master"
-
-        # If project has repos defined in registry
         for r in repos:
             val = r.get("path")
             if not isinstance(val, str):
                 continue
             val = val.replace("$HOME/Projects", str(root), 1)
             repo_path = Path(val).expanduser().resolve()
-            st = check_single_repo(repo_path, root)
+            targets.append((str(r.get("id", "")), repo_path))
+            unique_paths[repo_path] = repo_path
+
+        if not targets:
+            direct = (root / pname).resolve()
+            targets.append(("workspace", direct))
+            unique_paths[direct] = direct
+
+        project_repo_targets.append((p, targets))
+
+    unique_paths[root] = root
+
+    repo_cache: dict[Path, dict | None] = {}
+    worker_count = max(1, min(max_workers, len(unique_paths)))
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = {rp: pool.submit(check_single_repo, rp, root) for rp in unique_paths}
+        for rp, fut in futures.items():
+            repo_cache[rp] = fut.result()
+
+    results: dict[str, dict] = {}
+    for p, targets in project_repo_targets:
+        pid = str(p.get("id", ""))
+        pname = str(p.get("name", ""))
+        repo_list = []
+        total_dirty = 0
+        total_ahead = 0
+        total_behind = 0
+        primary_branch = "master"
+
+        for rid, repo_path in targets:
+            st = repo_cache.get(repo_path)
             if st:
                 repo_list.append(st)
                 total_dirty += st["dirty"]
                 total_ahead += st["ahead"]
                 total_behind += st["behind"]
-                if r.get("id") == "workspace" or primary_branch == "master":
+                if rid == "workspace" or primary_branch == "master":
                     primary_branch = st["branch"]
 
-        # If project didn't declare repos or none were found, check project root directly
         if not repo_list:
-            direct = root / pname
-            st = check_single_repo(direct, root)
+            direct = (root / pname).resolve()
+            st = repo_cache.get(direct)
             if st:
                 repo_list.append(st)
                 total_dirty += st["dirty"]
@@ -146,8 +205,7 @@ def inspect_workspace(root: Path) -> dict:
             results[folder_name] = status_obj
             results[folder_name.replace("-", "").replace("_", "")] = status_obj
 
-    # Also inspect meta-repo root
-    meta = check_single_repo(root, root)
+    meta = repo_cache.get(root)
     if meta:
         results["workspace-root"] = {
             "dirty": meta["dirty"],

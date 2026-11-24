@@ -1,0 +1,103 @@
+{
+  "note": "Synthetic payloads. Node (sources.js) and Swift (AIProviderStatus.swift) parsers must return the same status for each case; expect 'error' means the parser throws.",
+  "cases": [
+    {
+      "name": "statuspage all relevant operational",
+      "parser": "statuspage",
+      "relevant": ["A", "B"],
+      "input": {
+        "components": [
+          { "name": "A", "status": "operational" },
+          { "name": "B", "status": "under_maintenance" },
+          { "name": "C", "status": "major_outage" }
+        ]
+      },
+      "expect": "ok"
+    },
+    {
+      "name": "statuspage worst relevant component wins",
+      "parser": "statuspage",
+      "relevant": ["A", "B"],
+      "input": {
+        "components": [
+          { "name": "A", "status": "partial_outage" },
+          { "name": "B", "status": "major_outage" }
+        ]
+      },
+      "expect": "down"
+    },
+    {
+      "name": "statuspage degraded",
+      "parser": "statuspage",
+      "relevant": ["A"],
+      "input": { "components": [{ "name": "A", "status": "degraded_performance" }] },
+      "expect": "degraded"
+    },
+    {
+      "name": "statuspage missing relevant components",
+      "parser": "statuspage",
+      "relevant": ["A"],
+      "input": { "components": [{ "name": "Z", "status": "operational" }] },
+      "expect": "error"
+    },
+    {
+      "name": "statuspage unknown component status",
+      "parser": "statuspage",
+      "relevant": ["A"],
+      "input": { "components": [{ "name": "A", "status": "melting" }] },
+      "expect": "error"
+    },
+    {
+      "name": "google ended and unrelated incidents",
+      "parser": "google",
+      "input": [
+        { "service_name": "Vertex AI Gemini API", "end": "2026-01-01T00:00:00Z", "status_impact": "SERVICE_OUTAGE" },
+        { "service_name": "Cloud Storage", "status_impact": "SERVICE_OUTAGE", "external_desc": "x" }
+      ],
+      "expect": "ok"
+    },
+    {
+      "name": "google active Gemini outage",
+      "parser": "google",
+      "input": [
+        {
+          "service_name": "Example",
+          "affected_products": [{ "title": "Vertex AI Gemini API" }],
+          "status_impact": "SERVICE_OUTAGE",
+          "external_desc": "Synthetic outage"
+        }
+      ],
+      "expect": "down"
+    },
+    {
+      "name": "google active Gemini disruption",
+      "parser": "google",
+      "input": [{ "service_name": "Gemini", "status_impact": "SERVICE_DISRUPTION", "external_desc": "Synthetic" }],
+      "expect": "degraded"
+    },
+    {
+      "name": "opencode stale",
+      "parser": "opencode",
+      "input": { "stale": true, "status": "operational" },
+      "expect": "error"
+    },
+    {
+      "name": "opencode operational",
+      "parser": "opencode",
+      "input": { "status": "operational", "components": [{ "service": "api", "status": "operational" }] },
+      "expect": "ok"
+    },
+    {
+      "name": "opencode outage alias",
+      "parser": "opencode",
+      "input": { "status": "outage", "components": [] },
+      "expect": "down"
+    },
+    {
+      "name": "opencode unknown global status",
+      "parser": "opencode",
+      "input": { "status": "mystery" },
+      "expect": "error"
+    }
+  ]
+}

@@ -11,14 +11,20 @@ personal machine configuration into this repo.
   at rest. Measure current and peak footprint, plus transient helper processes.
   Keep a single resident app; AI checks run at most every five minutes in the
   background. Never start an IDE, browser, or model request to obtain usage.
+- Background load: the one-minute tick reads ports and the catalog only. Git
+  status runs on its own five-minute cadence (plus menu open with a cooldown and
+  after actions), one helper at a time with bounded per-repo concurrency and
+  `GIT_OPTIONAL_LOCKS=0`. Every spawned command needs a timeout; keep file reads
+  and hashing off the main thread.
 - Use only sanitized quota snapshots. Preserve stale/unavailable states and source
   boundaries: Codex quota, Claude Code captures, local Zen spend, and Antigravity
   model quota are different metrics. Do not turn missing fields into zero usage.
 - AI provider availability is a Switchboard feature in
   `Features/ProviderStatus/`, not a nested project. Its Swift adapter, Node
   probes, tests and integration notes live together; the root `package.json`
-  owns Node commands. The app runs the read-only JSON command every five
-  minutes. Keep state under the ignored feature `.data/` directory and
+  owns Node commands. The app reads provider status natively every five
+  minutes (no Node child); keep `AIProviderStatus.swift` and `src/sources.js`
+  in parity via `test/fixtures/parity.json`. Keep state under the ignored feature `.data/` directory and
   preserve `unknown` states and source boundaries. Do not enable notifications
   or a separate LaunchAgent automatically.
 - The Claude bridge may add a status line only when none exists; preserve existing
